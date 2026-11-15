@@ -132,10 +132,21 @@ void pollTouch() {
   lastPoll = millis();
   static TS_Point lastValidRaw(0, 0, 0);
   TS_Point raw(0, 0, 0);
-  bool sensed = touchPanel.touched();
-  if (sensed) {
-    raw = touchPanel.getPoint(); sensed = raw.z >= 200;
-    if (sensed) lastValidRaw = raw;
+  // Capture PENIRQ *before* SPI. During ADC conversions XPT2046 can
+  // temporarily deassert IRQ, so a post-read value is not authoritative.
+  const bool irqPressed = digitalRead(TOUCH_IRQ_PIN) == LOW;
+  // When the interrupt line is HIGH and no finger touches the screen,
+  // a corrupted MISO read can produce false z ~= 4095 indefinitely.
+  bool sensed = false;
+  if (irqPressed) {
+    sensed = touchPanel.touched();
+    if (sensed) {
+      raw = touchPanel.getPoint();
+      sensed = raw.z >= 300 && raw.z <= 4095 &&
+               raw.x >= 100 && raw.x <= 3995 &&
+               raw.y >= 100 && raw.y <= 3995;
+      if (sensed) lastValidRaw = raw;
+    }
   }
   if (!sensed && stablePressed) raw = lastValidRaw;
   const uint32_t now = millis();
@@ -148,8 +159,9 @@ void pollTouch() {
   static uint32_t lastDiagnostic = 0;
   if ((calibrating || touchDiagnostics) && now - lastDiagnostic >= 1000) {
     lastDiagnostic = now;
-    Serial.printf("TOUCH RAW x=%d y=%d z=%d sensed=%d stable=%d irq=%d etapa=%d espera_solta=%d\n",
-      raw.x, raw.y, raw.z, sensed, stablePressed, digitalRead(TOUCH_IRQ_PIN), calibrationStep, calibrationWaitRelease);
+    Serial.printf("TOUCH RAW x=%d y=%d z=%d sensed=%d stable=%d irq_pre=%d irq_pos=%d etapa=%d espera_solta=%d\n",
+      raw.x, raw.y, raw.z, sensed, stablePressed, irqPressed ? 0 : 1,
+      digitalRead(TOUCH_IRQ_PIN), calibrationStep, calibrationWaitRelease);
   }
   if (calibrating) { calibrateSample(stablePressed, raw); return; }
   if (!touchRearm) { if (!stablePressed) touchRearm = true; return; }
@@ -187,7 +199,7 @@ void setup() {
     touchPreferences.getBytes("affine", &touchCalibration, sizeof(touchCalibration));
   Serial.printf("TOUCH ready=%d / SPI dedicado / segure 2s ou envie c\n", touchReady);
   Serial.println("SERIAL: c=calibrar, x=cancelar, t=diagnostico de toque");
-  Serial.println("DIAGNOSTICO: IRQ GPIO36 (normalmente 1 solto, 0 pressionado).");
+  Serial.println("DIAGNOSTICO: IRQ GPIO36 lido ANTES da SPI (1=solto, 0=toque).");
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); initClock(); startWeatherNetwork();
   delay(600); lastPageChange = millis(); dirty = true;
