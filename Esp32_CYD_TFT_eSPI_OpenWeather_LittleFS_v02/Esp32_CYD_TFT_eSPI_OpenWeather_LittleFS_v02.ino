@@ -21,8 +21,8 @@
 #endif
 
 SPIClass touchSPI(VSPI);
-// Poll pressure: IRQ gating is unreliable on some CYD boards.
-XPT2046_Touchscreen touchPanel(TOUCH_CS_PIN, 255);
+// Use the real PENIRQ GPIO36, as in the CYD/XPT2046 reference examples.
+XPT2046_Touchscreen touchPanel(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 Preferences touchPreferences;
 TouchCalibration touchCalibration;
 WeatherState weather;
@@ -40,6 +40,9 @@ bool touchRearm = true;
 bool candidatePressed = false, stablePressed = false;
 uint32_t candidateSince = 0;
 bool touchDiagnostics = false;
+// Diagnostic mode bypasses the IRQ gate for raw SPI inspection only.
+// It never generates touch gestures or calibration samples.
+bool touchRawMode = false;
 bool fingerDown = false;
 int startX = 0, startY = 0, endX = 0, endY = 0;
 uint32_t fingerStart = 0, lastFingerSeen = 0;
@@ -122,6 +125,14 @@ void handleSerialCommands() {
     } else if (command == 't' || command == 'T') {
       touchDiagnostics = !touchDiagnostics;
       Serial.printf("TOUCH diagnostico=%d\n", touchDiagnostics);
+    } else if (command == 'r' || command == 'R') {
+      touchRawMode = !touchRawMode;
+      if (calibrating) stopCalibration("cancelada para diagnostico RAW");
+      fingerDown = false;
+      touchRearm = false;
+      candidatePressed = stablePressed = false;
+      candidateSince = millis();
+      Serial.printf("TOUCH modo RAW=%d (sem gestos; r novamente para sair)\n", touchRawMode);
     }
   }
 }
@@ -132,21 +143,25 @@ void pollTouch() {
   lastPoll = millis();
   static TS_Point lastValidRaw(0, 0, 0);
   TS_Point raw(0, 0, 0);
-  // Capture PENIRQ *before* SPI. During ADC conversions XPT2046 can
-  // temporarily deassert IRQ, so a post-read value is not authoritative.
+  // IRQ is sampled before SPI: PENIRQ may deassert during ADC conversion.
   const bool irqPressed = digitalRead(TOUCH_IRQ_PIN) == LOW;
-  // When the interrupt line is HIGH and no finger touches the screen,
-  // a corrupted MISO read can produce false z ~= 4095 indefinitely.
   bool sensed = false;
-  if (irqPressed) {
-    sensed = touchPanel.touched();
-    if (sensed) {
-      raw = touchPanel.getPoint();
-      sensed = raw.z >= 300 && raw.z <= 4095 &&
-               raw.x >= 100 && raw.x <= 3995 &&
-               raw.y >= 100 && raw.y <= 3995;
-      if (sensed) lastValidRaw = raw;
-    }
+  bool driverTouched = false;
+
+  if (irqPressed || touchRawMode) {
+    // In raw diagnostic mode we deliberately force polling even if the
+    // XPT2046 library's interrupt latch is not set.
+    if (touchRawMode) touchPanel.isrWake = true;
+    driverTouched = touchPanel.touched();
+    if (driverTouched || touchRawMode) raw = touchPanel.getPoint();
+
+    // A valid hardware touch needs both PENIRQ and plausible samples.
+    // On some SPI failures the driver reports Z ~= 4095 when idle.
+    sensed = irqPressed && driverTouched &&
+             raw.z >= 300 && raw.z <= 4095 &&
+             raw.x >= 100 && raw.x <= 3995 &&
+             raw.y >= 100 && raw.y <= 3995;
+    if (sensed) lastValidRaw = raw;
   }
   if (!sensed && stablePressed) raw = lastValidRaw;
   const uint32_t now = millis();
@@ -157,12 +172,13 @@ void pollTouch() {
     if (touchDiagnostics) Serial.printf("TOUCH %s\n", stablePressed ? "PRESSIONADO" : "SOLTO");
   }
   static uint32_t lastDiagnostic = 0;
-  if ((calibrating || touchDiagnostics) && now - lastDiagnostic >= 1000) {
+  if ((calibrating || touchDiagnostics || touchRawMode) && now - lastDiagnostic >= (touchRawMode ? 500UL : 1000UL)) {
     lastDiagnostic = now;
-    Serial.printf("TOUCH RAW x=%d y=%d z=%d sensed=%d stable=%d irq_pre=%d irq_pos=%d etapa=%d espera_solta=%d\n",
-      raw.x, raw.y, raw.z, sensed, stablePressed, irqPressed ? 0 : 1,
-      digitalRead(TOUCH_IRQ_PIN), calibrationStep, calibrationWaitRelease);
+    Serial.printf("TOUCH RAW x=%d y=%d z=%d driver=%d sensed=%d stable=%d irq_pre=%d irq_pos=%d etapa=%d espera_solta=%d modo=%d\n",
+      raw.x, raw.y, raw.z, driverTouched, sensed, stablePressed, irqPressed ? 0 : 1,
+      digitalRead(TOUCH_IRQ_PIN), calibrationStep, calibrationWaitRelease, touchRawMode);
   }
+  if (touchRawMode) return;  // No calibration or navigation while probing SPI.
   if (calibrating) { calibrateSample(stablePressed, raw); return; }
   if (!touchRearm) { if (!stablePressed) touchRearm = true; return; }
   if (stablePressed) {
@@ -189,7 +205,7 @@ void setup() {
   }
   Serial.printf("Display setup=%d backlight=%d size=%dx%d\n", USER_SETUP_ID, TFT_BL, tft.width(), tft.height());
   auditAssets(); showBootSplash();
-  pinMode(TOUCH_CS_PIN, OUTPUT); digitalWrite(TOUCH_CS_PIN, HIGH); pinMode(TOUCH_IRQ_PIN, INPUT);
+  pinMode(TOUCH_CS_PIN, OUTPUT); digitalWrite(TOUCH_CS_PIN, HIGH);
   touchSPI.begin(TOUCH_CLK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
   touchReady = touchPanel.begin(touchSPI); touchPanel.setRotation(TOUCH_ROTATION);
   touchPreferences.begin("cyd-touch-v3", false);
@@ -198,8 +214,8 @@ void setup() {
       touchPreferences.getBytesLength("affine") == sizeof(TouchCalibration))
     touchPreferences.getBytes("affine", &touchCalibration, sizeof(touchCalibration));
   Serial.printf("TOUCH ready=%d / SPI dedicado / segure 2s ou envie c\n", touchReady);
-  Serial.println("SERIAL: c=calibrar, x=cancelar, t=diagnostico de toque");
-  Serial.println("DIAGNOSTICO: IRQ GPIO36 lido ANTES da SPI (1=solto, 0=toque).");
+  Serial.println("SERIAL: c=calibrar, x=cancelar, t=diagnostico, r=SPI RAW (sem gestos)");
+  Serial.println("DIAGNOSTICO: PENIRQ 36 habilitado na biblioteca (1=solto, 0=toque).");
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); initClock(); startWeatherNetwork();
   delay(600); lastPageChange = millis(); dirty = true;
