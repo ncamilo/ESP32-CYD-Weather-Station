@@ -1,9 +1,9 @@
 name: Firmware ESP32-CYD (PlatformIO)
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, 'feature/**', 'fix/**']
   push:
-    branches: [develop, main, 'feature/**']
+    branches: [develop, main, 'feature/**', 'fix/**']
   workflow_dispatch:
 jobs:
   firmware:

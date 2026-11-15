@@ -21,8 +21,8 @@
 #endif
 
 SPIClass touchSPI(VSPI);
-// Poll pressure: IRQ gating is unreliable on some CYD boards.
-XPT2046_Touchscreen touchPanel(TOUCH_CS_PIN, 255);
+// Use the real PENIRQ GPIO36, as in the CYD/XPT2046 reference examples.
+XPT2046_Touchscreen touchPanel(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 Preferences touchPreferences;
 TouchCalibration touchCalibration;
 WeatherState weather;
@@ -36,6 +36,13 @@ int calibrationStep = 0, calibrationRaw[4][2] = {};
 uint32_t calibrationStarted = 0, calibrationPressStart = 0;
 long calibrationSumX = 0, calibrationSumY = 0;
 int calibrationSamples = 0;
+bool touchRearm = true;
+bool candidatePressed = false, stablePressed = false;
+uint32_t candidateSince = 0;
+bool touchDiagnostics = false;
+// Diagnostic mode bypasses the IRQ gate for raw SPI inspection only.
+// It never generates touch gestures or calibration samples.
+bool touchRawMode = false;
 bool fingerDown = false;
 int startX = 0, startY = 0, endX = 0, endY = 0;
 uint32_t fingerStart = 0, lastFingerSeen = 0;
@@ -51,11 +58,17 @@ void changePage(int next) {
   page = wrapPage(next); dirty = true; lastPageChange = millis();
   Serial.printf("PAGE %d %s\n", page, page == 0 ? "Inicio" : page == 1 ? "Previsao" : page == 2 ? "Condicoes" : "Sistema");
 }
+void stopCalibration(const char* reason) {
+  calibrating = false; fingerDown = false; touchRearm = false;
+  dirty = true; lastPageChange = millis();
+  Serial.printf("CALIBRACAO %s\n", reason);
+}
 void startCalibration() {
   calibrating = true; calibrationStep = 0; calibrationStarted = millis();
   calibrationWaitRelease = true; calibrationFailed = false;
   calibrationSamples = 0; calibrationPressStart = 0; fingerDown = false;
-  renderCalibration(0); Serial.println("CALIBRACAO iniciada");
+  renderCalibration(0);
+  Serial.println("CALIBRACAO iniciada. Pressione 0,2s e SOLTE cada alvo. Serial x cancela.");
 }
 void handleGesture(int x0, int y0, int x1, int y1) {
   lastPageChange = millis();
@@ -69,7 +82,7 @@ void handleGesture(int x0, int y0, int x1, int y1) {
 }
 void calibrateSample(bool pressed, const TS_Point& raw) {
   if (millis() - calibrationStarted > 90000) {
-    calibrating = false; dirty = true; lastPageChange = millis(); Serial.println("CALIBRACAO esgotou tempo"); return;
+    stopCalibration("esgotou tempo"); return;
   }
   if (calibrationWaitRelease) {
     if (!pressed) {
@@ -80,7 +93,7 @@ void calibrateSample(bool pressed, const TS_Point& raw) {
         if (fitTouchCalibration(calibrationRaw, result)) {
           touchCalibration = result;
           touchPreferences.putBytes("affine", &touchCalibration, sizeof(touchCalibration));
-          calibrating = false; dirty = true; lastPageChange = millis(); Serial.println("CALIBRACAO salva"); return;
+          stopCalibration("salva"); return;
         }
         calibrationStep = 0; calibrationFailed = true; Serial.println("CALIBRACAO rejeitada; tentar novamente");
       }
@@ -93,7 +106,7 @@ void calibrateSample(bool pressed, const TS_Point& raw) {
   }
   if (!calibrationSamples) calibrationPressStart = millis();
   calibrationSumX += raw.x; calibrationSumY += raw.y; ++calibrationSamples;
-  if (millis() - calibrationPressStart >= 350 && calibrationSamples >= 8) {
+  if (millis() - calibrationPressStart >= 160 && calibrationSamples >= 4) {
     calibrationRaw[calibrationStep][0] = calibrationSumX / calibrationSamples;
     calibrationRaw[calibrationStep][1] = calibrationSumY / calibrationSamples;
     Serial.printf("CALIBRACAO ponto=%d bruto=%d,%d\n", calibrationStep,
@@ -101,17 +114,76 @@ void calibrateSample(bool pressed, const TS_Point& raw) {
     ++calibrationStep; calibrationWaitRelease = true;
   }
 }
+void handleSerialCommands() {
+  while (Serial.available()) {
+    const char command = static_cast<char>(Serial.read());
+    if (command == 'c' || command == 'C') {
+      if (touchReady) startCalibration();
+      else Serial.println("TOUCH indisponivel");
+    } else if (command == 'x' || command == 'X') {
+      if (calibrating) stopCalibration("cancelada");
+    } else if (command == 't' || command == 'T') {
+      touchDiagnostics = !touchDiagnostics;
+      Serial.printf("TOUCH diagnostico=%d\n", touchDiagnostics);
+    } else if (command == 'r' || command == 'R') {
+      touchRawMode = !touchRawMode;
+      if (calibrating) stopCalibration("cancelada para diagnostico RAW");
+      fingerDown = false;
+      touchRearm = false;
+      candidatePressed = stablePressed = false;
+      candidateSince = millis();
+      Serial.printf("TOUCH modo RAW=%d (sem gestos; r novamente para sair)\n", touchRawMode);
+    }
+  }
+}
 void pollTouch() {
   if (!touchReady) return;
   static uint32_t lastPoll = 0;
   if (millis() - lastPoll < 12) return;
   lastPoll = millis();
-  TS_Point raw; bool pressed = touchPanel.touched();
-  if (pressed) { raw = touchPanel.getPoint(); pressed = raw.z >= 200; }
-  if (calibrating) { calibrateSample(pressed, raw); return; }
-  if (pressed) {
+  static TS_Point lastValidRaw(0, 0, 0);
+  TS_Point raw(0, 0, 0);
+  // IRQ is sampled before SPI: PENIRQ may deassert during ADC conversion.
+  const bool irqPressed = digitalRead(TOUCH_IRQ_PIN) == LOW;
+  bool sensed = false;
+  bool driverTouched = false;
+
+  if (irqPressed || touchRawMode) {
+    // In raw diagnostic mode we deliberately force polling even if the
+    // XPT2046 library's interrupt latch is not set.
+    if (touchRawMode) touchPanel.isrWake = true;
+    driverTouched = touchPanel.touched();
+    if (driverTouched || touchRawMode) raw = touchPanel.getPoint();
+
+    // A valid hardware touch needs both PENIRQ and plausible samples.
+    // On some SPI failures the driver reports Z ~= 4095 when idle.
+    sensed = irqPressed && driverTouched &&
+             raw.z >= 300 && raw.z <= 4095 &&
+             raw.x >= 100 && raw.x <= 3995 &&
+             raw.y >= 100 && raw.y <= 3995;
+    if (sensed) lastValidRaw = raw;
+  }
+  if (!sensed && stablePressed) raw = lastValidRaw;
+  const uint32_t now = millis();
+  if (sensed != candidatePressed) { candidatePressed = sensed; candidateSince = now; }
+  if (stablePressed != candidatePressed &&
+      now - candidateSince >= (candidatePressed ? 48UL : 72UL)) {
+    stablePressed = candidatePressed;
+    if (touchDiagnostics) Serial.printf("TOUCH %s\n", stablePressed ? "PRESSIONADO" : "SOLTO");
+  }
+  static uint32_t lastDiagnostic = 0;
+  if ((calibrating || touchDiagnostics || touchRawMode) && now - lastDiagnostic >= (touchRawMode ? 500UL : 1000UL)) {
+    lastDiagnostic = now;
+    Serial.printf("TOUCH RAW x=%d y=%d z=%d driver=%d sensed=%d stable=%d irq_pre=%d irq_pos=%d etapa=%d espera_solta=%d modo=%d\n",
+      raw.x, raw.y, raw.z, driverTouched, sensed, stablePressed, irqPressed ? 0 : 1,
+      digitalRead(TOUCH_IRQ_PIN), calibrationStep, calibrationWaitRelease, touchRawMode);
+  }
+  if (touchRawMode) return;  // No calibration or navigation while probing SPI.
+  if (calibrating) { calibrateSample(stablePressed, raw); return; }
+  if (!touchRearm) { if (!stablePressed) touchRearm = true; return; }
+  if (stablePressed) {
     int x, y; mapTouch(touchCalibration, raw.x, raw.y, x, y);
-    lastFingerSeen = millis(); endX = x; endY = y;
+    lastFingerSeen = now; endX = x; endY = y;
     if (!fingerDown) { fingerDown = true; fingerStart = millis(); startX = x; startY = y; }
     if (millis() - fingerStart > 2000 && abs(endX - startX) < 20 && abs(endY - startY) < 20) startCalibration();
   } else if (fingerDown && millis() - lastFingerSeen > 70) {
@@ -133,19 +205,23 @@ void setup() {
   }
   Serial.printf("Display setup=%d backlight=%d size=%dx%d\n", USER_SETUP_ID, TFT_BL, tft.width(), tft.height());
   auditAssets(); showBootSplash();
-  pinMode(TOUCH_CS_PIN, OUTPUT); digitalWrite(TOUCH_CS_PIN, HIGH); pinMode(TOUCH_IRQ_PIN, INPUT);
+  pinMode(TOUCH_CS_PIN, OUTPUT); digitalWrite(TOUCH_CS_PIN, HIGH);
   touchSPI.begin(TOUCH_CLK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
   touchReady = touchPanel.begin(touchSPI); touchPanel.setRotation(TOUCH_ROTATION);
   touchPreferences.begin("cyd-touch-v3", false);
   autoCycle = touchPreferences.getBool("auto", false);
-  if (touchPreferences.getBytesLength("affine") == sizeof(TouchCalibration))
+  if (touchPreferences.isKey("affine") &&
+      touchPreferences.getBytesLength("affine") == sizeof(TouchCalibration))
     touchPreferences.getBytes("affine", &touchCalibration, sizeof(touchCalibration));
-  Serial.printf("TOUCH ready=%d / own SPI bus / long press to calibrate\n", touchReady);
+  Serial.printf("TOUCH ready=%d / SPI dedicado / segure 2s ou envie c\n", touchReady);
+  Serial.println("SERIAL: c=calibrar, x=cancelar, t=diagnostico, r=SPI RAW (sem gestos)");
+  Serial.println("DIAGNOSTICO: PENIRQ 36 habilitado na biblioteca (1=solto, 0=toque).");
   WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD); initClock(); startWeatherNetwork();
   delay(600); lastPageChange = millis(); dirty = true;
 }
 void loop() {
+  handleSerialCommands();
   pollTouch();
   WeatherState latest; copyWeatherState(latest);
   if (latest.generation != weather.generation) {
